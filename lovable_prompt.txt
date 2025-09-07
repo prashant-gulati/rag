@@ -426,20 +426,10 @@ def main():
 if __name__ == "__main__":
     main()
 
-You will already have my SUPABASE KEYS and OPENAI KEY
-
-Make the look of the website very cool!! The chat interface should look minimal and sleek like OpenAI
-
-Show three dots when responding. 
-
-Show citations when you have pages to cite. I mean clickable citations, when I click on it a small popup highlighting the place from the text it was taken should be shown!
-
-Instead of Nutriton AI: Can you give the name as RAG Nutritional Chatbot: Build from Scratch
-
-Make theme of text and font etc as this website:
-
-https://arcprize.org/arc-agi
-
-This theme is very, very important to follow: https://arcprize.org/arc-agi
-
-Also show small sounds when the three dots are coming and small sound when response is generated
+- You already have my SUPABASE KEYS and OPENAI KEY
+- Make the look of the website very cool!! The chat interface should look minimal and sleek like OpenAI
+- Show three dots when responding. 
+- Show citations when you have pages to cite. I mean clickable citations, when I click on it a small popup highlighting the place from the text it was taken should be shown!
+- Instead of Nutriton AI: Can you name this RAG Nutritional Chatbot: Build from Scratch
+- Make theme of text and font etc similar to this website: https://arcprize.org/arc-agi
+- Also play sounds when the three dots are showing up and sounds when a response is generated
