@@ -2,6 +2,8 @@
 
 A Retrieval-Augmented Generation (RAG) system for PDF documents, using OpenAI embeddings and Supabase (pgvector) as the vector store.
 
+**Working implementation: [rag-nutrition.lovable.app](https://rag-nutrition.lovable.app/)**
+
 ## Architecture
 
 ```
