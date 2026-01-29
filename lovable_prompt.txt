@@ -1,0 +1,445 @@
+I have built a functional RAG pipeline:
+
+SQL Editor code on Supabase:
+
+-- Enable pgvector
+create extension if not exists vector;
+
+-- Table for your chunks
+create table if not exists public.chunks (
+  id bigserial primary key,
+  doc_id text not null,
+  chunk_index int not null,
+  content text not null,
+  metadata jsonb default '{}'::jsonb,
+  embedding vector(1536) -- match your embedding dimension
+);
+
+-- (Recommended) cosine distance index for fast ANN search
+create index if not exists idx_chunks_embedding
+  on public.chunks using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
+
+-- Simple similarity search function (with optional metadata filter)
+create or replace function public.match_documents(
+  query_embedding vector(1536),
+  match_count int default 5,
+  filter jsonb default '{}'::jsonb
+)
+returns table (
+  id bigint,
+  doc_id text,
+  chunk_index int,
+  content text,
+  metadata jsonb,
+  similarity float
+)
+language plpgsql
+stable
+as $$
+begin
+  return query
+  select
+    c.id,
+    c.doc_id,
+    c.chunk_index,
+    c.content,
+    c.metadata,
+    1 - (c.embedding <=> query_embedding) as similarity  -- cosine similarity
+  from public.chunks c
+  where (filter = '{}'::jsonb) or (c.metadata @> filter)
+  order by c.embedding <=> query_embedding               -- lower distance is better
+  limit match_count;
+end;
+$$;
+
+I have following files:
+
+1) File rag-chat/src/app/api/chat/route.ts:
+import { NextRequest } from "next/server";
+import OpenAI from "openai";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs";          // ensure Node runtime (service role key, Node SDKs)
+export const dynamic = "force-dynamic";   // no caching of answers
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
+
+// Service role key is server-only; never import this file on the client.
+const supabase = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { persistSession: false, autoRefreshToken: false } }
+);
+
+async function embedQuery(query: string) {
+  const resp = await openai.embeddings.create({
+    model: "text-embedding-3-small",   // 1536-dim; matches your table
+    input: query
+  });
+  return resp.data[0].embedding;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const message = (body?.message ?? "").toString().trim();
+
+    if (!message) {
+      return new Response(JSON.stringify({ error: "Empty query" }), {
+        status: 400,
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    // 1) Embed the query
+    const queryEmb = await embedQuery(message);
+
+    // 2) Retrieve from Supabase (constrain to this PDF)
+    const { data: chunks, error } = await supabase.rpc("match_documents", {
+      query_embedding: queryEmb,
+      match_count: 8,
+      filter: { source: "human-nutrition-text.pdf" },
+    });
+
+    if (error) throw error;
+
+    // Optional: log retrieval for debugging in server logs
+    // console.log("retrieved", (chunks ?? []).map((c: any) => ({
+    //   p: c.metadata?.page, sim: Number(c.similarity).toFixed(3),
+    //   prev: c.content.slice(0, 100)
+    // })));
+
+    // 3) Build the context (show page numbers)
+    const context = (chunks ?? [])
+      .map((c: any, i: number) => `[${i + 1}] (Page ${c.metadata?.page ?? "?"}) ${c.content}`)
+      .join("\n\n");
+
+    // If nothing relevant was found, short-circuit with a helpful reply
+    if (!context) {
+      return new Response(JSON.stringify({
+        answer:
+          "I couldn’t find this in the provided document. Try rephrasing or asking about a different section.",
+        sources: []
+      }), { status: 200, headers: { "content-type": "application/json" }});
+    }
+
+    // 4) Ask the model with strict instructions
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a strict RAG assistant. Answer ONLY using the CONTEXT. " +
+            "If the answer is not present, say: 'I couldn’t find this in the provided document.' " +
+            "Cite sources like [1], [2] and include page numbers (e.g., p. X) next to each claim."
+        },
+        { role: "user", content: `QUESTION: ${message}\n\nCONTEXT:\n${context}` }
+      ]
+    });
+
+    return new Response(JSON.stringify({
+      answer: completion.choices[0]?.message?.content ?? "",
+      sources: chunks ?? []
+    }), { status: 200, headers: { "content-type": "application/json" }});
+
+  } catch (err: any) {
+    console.error("api/chat error:", err?.message || err);
+    return new Response(JSON.stringify({ error: err?.message || "Unknown error" }), {
+      status: 500,
+      headers: { "content-type": "application/json" }
+    });
+  }
+}
+
+2) File ingest.py:
+
+#pip install pymupdf tiktoken supabase openai tqdm python-dotenv
+
+import os, uuid, re
+import fitz  # PyMuPDF
+import tiktoken
+from supabase import create_client, Client
+from openai import OpenAI
+from tqdm import tqdm
+from dotenv import load_dotenv, find_dotenv
+
+# ---- Load environment
+load_dotenv(find_dotenv(usecwd=True))
+
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+# ---- Config
+PDF_PATH = "human-nutrition-text.pdf"
+DOC_ID = "nutrition-v1"               # keep this STABLE to avoid duplicates
+EMBED_MODEL = "text-embedding-3-small"  # 1536 dims -> matches your table
+BATCH_EMBED = 100
+BATCH_INSERT = 200
+
+# Sentence chunking params
+SENTS_PER_CHUNK = 20
+SENT_OVERLAP = 2
+MAX_TOKENS = 1300     # safety cap (trim if 10 sentences are too long)
+MIN_TOKENS = 50      # skip very tiny fragments
+
+enc = tiktoken.get_encoding("cl100k_base")  # matches OpenAI embeddings tokenizer
+
+def clean_text(t: str) -> str:
+    # normalize whitespace and fix hyphenation across line breaks
+    t = t.replace("\r", " ")
+    t = re.sub(r"-\s*\n\s*", "", t)     # join "nutri-\n tion" => "nutrition"
+    t = re.sub(r"\s+\n", "\n", t)
+    t = re.sub(r"[ \t]+", " ", t)
+    t = t.replace("\n", " ").strip()
+    return t
+
+def split_sentences(text: str):
+    # simple sentence splitter (good for prose)
+    sents = re.split(r'(?<=[.!?])\s+', text.strip())
+    return [s.strip() for s in sents if s.strip()]
+
+def chunk_page_by_sentences(text: str,
+                            sents_per_chunk: int = SENTS_PER_CHUNK,
+                            overlap: int = SENT_OVERLAP,
+                            max_tokens: int = MAX_TOKENS,
+                            min_tokens: int = MIN_TOKENS):
+    sents = split_sentences(text)
+    i = 0
+    step = max(1, sents_per_chunk - overlap)
+    while i < len(sents):
+        piece = sents[i:i + sents_per_chunk]
+        if not piece:
+            break
+        chunk = " ".join(piece)
+
+        # enforce token ceiling
+        ids = enc.encode(chunk)
+        while max_tokens and len(ids) > max_tokens and len(piece) > 1:
+            piece = piece[:-1]
+            chunk = " ".join(piece)
+            ids = enc.encode(chunk)
+
+        if len(ids) >= min_tokens:
+            yield chunk
+        i += step
+
+def pdf_pages(path: str):
+    """Yield (page_number_1based, cleaned_text)."""
+    doc = fitz.open(path)
+    try:
+        for i in range(len(doc)):
+            txt = doc[i].get_text("text") or ""
+            yield (i + 1, clean_text(txt))
+    finally:
+        doc.close()
+
+def main():
+    sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    # Optional: keep the table clean for this document
+    sb.table("chunks").delete().eq("doc_id", DOC_ID).execute()
+
+    print("Reading PDF by pages...")
+    pages = list(pdf_pages(PDF_PATH))
+
+    # Build chunks with page metadata
+    inputs, metas = [], []
+    print("Chunking (10 sentences per chunk, 2 overlap)...")
+    for page, text in pages:
+        if not text:
+            continue
+        for chunk in chunk_page_by_sentences(text):
+            inputs.append(chunk)
+            metas.append({"page": page, "source": PDF_PATH})
+
+    print(f"✅ Built {len(inputs)} chunks from {PDF_PATH}")
+
+    # Generate embeddings
+    vectors = []
+    print("Generating embeddings...")
+    for i in tqdm(range(0, len(inputs), BATCH_EMBED), desc="Embedding"):
+        batch = inputs[i:i + BATCH_EMBED]
+        resp = client.embeddings.create(model=EMBED_MODEL, input=batch)
+        vectors.extend([d.embedding for d in resp.data])
+
+    # Prepare rows
+    rows = []
+    for idx, (content, emb, meta) in enumerate(zip(inputs, vectors, metas)):
+        rows.append({
+            "doc_id": DOC_ID,
+            "chunk_index": idx,
+            "content": content,
+            "metadata": meta,      # contains {source, page}
+            "embedding": emb
+        })
+
+    print("Uploading to Supabase...")
+    for j in tqdm(range(0, len(rows), BATCH_INSERT), desc="Uploading"):
+        sb.table("chunks").insert(rows[j:j+BATCH_INSERT]).execute()
+
+    print(f"🎉 Done! Inserted {len(rows)} chunks for doc_id={DOC_ID}")
+
+if __name__ == "__main__":
+    main()
+
+
+3) File app/page.tsx:
+
+"use client";
+import { useState } from "react";
+
+export default function Home() {
+  const [input, setInput] = useState("");
+  const [messages, setMessages] = useState<{role:"user"|"assistant", content:string}[]>([]);
+  const [sources, setSources] = useState<any[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  async function send() {
+    if (!input.trim()) return;
+    setMessages(m => [...m, { role:"user", content: input }]);
+    setBusy(true);
+
+    const res = await fetch("/api/chat", {
+      method:"POST",
+      headers: { "Content-Type":"application/json" },
+      body: JSON.stringify({ message: input })
+    });
+    const data = await res.json();
+
+    setMessages(m => [...m, { role:"assistant", content: data.answer }]);
+    setSources(data.sources || []);
+    setInput("");
+    setBusy(false);
+  }
+
+  return (
+    <main className="p-6 max-w-3xl mx-auto">
+      <h1 className="text-2xl font-bold mb-4">Nutrition RAG Chat</h1>
+
+      <div className="space-y-3 mb-4">
+        {messages.map((m,i)=>(
+          <div key={i} className={m.role==="user"?"text-right":"text-left"}>
+            <div className={`inline-block px-4 py-2 rounded-lg ${
+              m.role==="user" ? "bg-blue-600 text-white":"bg-gray-200"
+            }`}>
+              {m.content}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div className="flex gap-2">
+        <input
+          className="flex-1 border rounded px-3 py-2"
+          value={input}
+          onChange={e=>setInput(e.target.value)}
+          onKeyDown={e=>e.key==="Enter" && send()}
+          placeholder="Ask about the nutrition PDF..."
+          disabled={busy}
+        />
+        <button onClick={send} disabled={busy} className="bg-blue-600 text-white px-4 rounded">
+          Send
+        </button>
+      </div>
+
+      {sources.length > 0 && (
+        <div className="mt-6">
+          <h2 className="font-semibold mb-2">Sources</h2>
+          <ul className="space-y-2">
+            {sources.map((s, i)=>(
+              <li key={s.id} className="border rounded p-2 text-sm bg-gray-50">
+  <strong>[{i+1}]</strong>
+  {" "}Page: {s.metadata?.page ?? "?"}
+  {" "}· sim: {typeof s.similarity === "number" ? s.similarity.toFixed(3) : "—"}
+  {" "}— {s.content.slice(0, 150)}...
+</li>
+
+            ))}
+          </ul>
+        </div>
+      )}
+    </main>
+  );
+}
+
+4) File TEST_EMBEDDINGS.PY:
+
+import os, textwrap
+from supabase import create_client, Client
+from openai import OpenAI
+from dotenv import load_dotenv, find_dotenv
+
+# ---- Load env
+load_dotenv(find_dotenv(usecwd=True))
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+
+EMBED_MODEL = "text-embedding-3-small"      # must match your table's 1536-dims
+PDF_PATH = "human-nutrition-text.pdf"       # used as a filter in metadata
+TOP_K = 3
+
+queries = [
+    "How often should infants be breastfed?",
+    "What are symptoms of pellagra?",
+    "How does saliva help with digestion?",
+    "What is the RDI for protein per day?",
+    "water soluble vitamins",
+    "What are micronutrients?"
+]
+
+def main():
+    sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    for q in queries:
+        # embed query
+        e = client.embeddings.create(model=EMBED_MODEL, input=q).data[0].embedding
+
+        # call your RPC with a metadata filter to this PDF
+        resp = sb.rpc("match_documents", {
+            "query_embedding": e,
+            "match_count": TOP_K,
+            "filter": {"source": PDF_PATH}
+        }).execute()
+
+        rows = resp.data or []
+        print("\n" + "="*90)
+        print(f"QUERY: {q}")
+        if not rows:
+            print("  (no matches)")
+            continue
+
+        for rank, r in enumerate(rows, start=1):
+            page = (r.get("metadata") or {}).get("page", "?")
+            sim  = r.get("similarity", None)
+            sim_str = f"{sim:.3f}" if isinstance(sim, (int, float)) else "?"
+            preview = textwrap.shorten(r.get("content","").replace("\n"," "), width=160)
+            print(f"  [{rank}] page {page}  sim={sim_str}  chunk_index={r.get('chunk_index')}")
+            print(f"      {preview}")
+
+if __name__ == "__main__":
+    main()
+
+You will already have my SUPABASE KEYS and OPENAI KEY
+
+Make the look of the website very cool!! The chat interface should look minimal and sleek like OpenAI
+
+Show three dots when responding. 
+
+Show citations when you have pages to cite. I mean clickable citations, when I click on it a small popup highlighting the place from the text it was taken should be shown!
+
+Instead of Nutriton AI: Can you give the name as RAG Nutritional Chatbot: Build from Scratch
+
+Make theme of text and font etc as this website:
+
+https://arcprize.org/arc-agi
+
+This theme is very, very important to follow: https://arcprize.org/arc-agi
+
+Also show small sounds when the three dots are coming and small sound when response is generated
